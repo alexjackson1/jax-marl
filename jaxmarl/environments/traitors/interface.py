@@ -1,55 +1,103 @@
+from typing import Dict, Optional, Tuple
+from functools import partial
+
 import jax
 import jax.numpy as jnp
-from typing import Dict
-import chex
-from functools import partial
-from flax import struct
-from typing import Tuple
 
-import numpy as np
+import chex
+from flax import struct
 
 from jaxmarl.environments.multi_agent_env import MultiAgentEnv
 from jaxmarl.environments.spaces import Discrete
 
+from .shared import Activity, ChallengePhase, Config, Phase
+from .schedule import next_timestep
+from .logic import GameLogic
+
 
 @struct.dataclass
 class State:
-    done: chex.Array
-    step: int
+    config: Config
+
+    # Timestep
+    day: int
+    activity: Activity
+    phase: Phase
+    phase_step: int
+    finished: bool
+
+    # Player Properties
+    players: chex.Array  # id of player
+    traitors: chex.Array  # 1 if traitor
+    murdered: chex.Array  # 1 if murdered
+    banished: chex.Array  # 1 if banished
+    at_risk: chex.Array  # 1 if at risk
+    has_shield: chex.Array  # 1 if has shield
+
+    # Game state
+    last_death: Optional[int]  # id of last death
+
+    banishment_selection: Optional[int]  # Group banishment target
+    traitor_action_selection: Optional[int]  # Traitor action
+    traitor_target_selection: Optional[int]  # Traitor recruitment/murder target
+    banish_again: Optional[bool]  # Whether to banish again in the endgame
+
+    def step(self) -> "State":
+        ts = next_timestep(self, self.config)
+        return self.replace(
+            day=ts.day,
+            activity=ts.activity,
+            phase=ts.phase,
+            phase_step=ts.phase_step,
+            finished=ts.finished,
+        )
+
+    def reset_shields(self) -> "State":
+        return self.replace(has_shield=jnp.zeros_like(self.has_shield))
+
+    def discover_death(self) -> "State":
+        if self.last_death is not None:
+            new_murdered = jnp.where(
+                self.murdered == 1 or self.players == self.last_death, 1, 0
+            )
+            return self.replace(murdered=new_murdered, last_death=None)
+
+        return self
 
 
 class TraitorsGame(MultiAgentEnv):
     """Traitors game environment suitable for JIT compilation with JAX."""
 
-    def __init__(
-        self,
-        num_agents: int,
-        init_traitors: int = 3,
-        num_days: int = 12,
-        roundtables: chex.Array = np.array([False] + [True] * 11),
-        secret_meetings: chex.Array = np.array([True] * 9 + [False, True, False]),
-        shields: chex.Array = np.array([3] * 3 + [2] * 3 + [1] * 3 + [0] * 3),
-        shield_success_rate: float = 0.25,
-        num_symbols: int = 3,
-    ) -> None:
-        """
-        Construct a new TraitorsGame environment.
+    NUM_ACTIVITIES = 4
+    MAX_PHASES = 4
+    MAX_PHASE_STEPS = 4
 
-        Args:
-            num_agents (int): maximum number of agents within the environment,
-            used to set array dimensions.
-        """
-        self.num_agents = num_agents
+    def __init__(self, config: Config) -> None:
+        """Construct a new TraitorsGame environment."""
+        self.config = config
 
-        self.init_traitors = init_traitors
-        self.num_days = num_days
-        self.roundtables = roundtables
-        self.secret_meetings = secret_meetings
-        self.shields = shields
-        self.num_symbols = num_symbols
-        self.shield_success_rate = shield_success_rate
+        # Basic configuration
+        self.num_agents = config.num_agents
+        self.init_traitors = config.init_traitors
+        self.num_days = config.num_days
+        self.roundtables = config.roundtables
+        self.secret_meetings = config.secret_meetings
+        self.shields = config.shields
+        self.num_symbols = config.num_symbols
+        self.shield_success_rate = config.shield_success_rate
 
-        self.num_moves = sum(
+        # Determine sizes of action/observation spaces
+        self.num_moves = self.count_moves()
+        self.obs_size = self.count_obs_size()
+
+        # Initialise action/observation spaces
+        self.agent_ids = [i for i in range(self.num_agents)]
+        self.action_set = jnp.arange(self.num_moves)
+        self.action_spaces = {i: Discrete(self.num_moves) for i in self.agent_ids}
+        self.observation_spaces = {i: Discrete(self.obs_size) for i in self.agent_ids}
+
+    def count_moves(self) -> int:
+        return sum(
             [
                 1,  # NOOP
                 2,  # End Game / Banish Again
@@ -61,36 +109,52 @@ class TraitorsGame(MultiAgentEnv):
             ]
         )
 
-        NUM_ACIVITIES = 4
-        MAX_PHASES = 4
-        MAX_PHASE_STEPS = 4
-        self.obs_size = sum(
-            self.num_agents,  # Player id
-            self.num_days,  # Day
-            NUM_ACIVITIES,  # Activity
-            MAX_PHASES,  # Phase
-            MAX_PHASE_STEPS,  # Phase step
-            self.num_agents,  # Dead
-            self.num_agents * 2,  # Shields (Doesn't have, does have)
-            self.num_agents,  # At risk/tiebreak
-            self.num_agents * self.num_agents * self.num_symbols,  # Open Signals
-            self.num_agents * self.num_agents * self.num_symbols,  # Secret Signals
-            self.num_agents * self.num_agents,  # Votes
+    def count_obs_size(self) -> int:
+        return sum(
+            [
+                self.num_agents,  # Player id
+                self.num_days,  # Day
+                TraitorsGame.NUM_ACTIVITIES,  # Activities
+                TraitorsGame.MAX_PHASES,  # Phase
+                TraitorsGame.MAX_PHASE_STEPS,  # Phase step
+                self.num_agents,  # Dead
+                self.num_agents * 2,  # Shields (Doesn't have, does have)
+                self.num_agents,  # At risk/tiebreak
+                self.num_agents * self.num_agents * self.num_symbols,  # Open Signals
+                self.num_agents * self.num_agents * self.num_symbols,  # Secret Signals
+                self.num_agents * self.num_agents,  # Votes
+            ]
         )
-
-        self.action_set = jnp.arange(self.num_moves)
-        self.action_spaces = {
-            i: Discrete(self.num_moves) for i in range(self.num_agents)
-        }
-        self.observation_spaces = {
-            i: Discrete(self.obs_size) for i in range(self.num_agents)
-        }
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, key: chex.PRNGKey) -> Tuple[Dict[str, chex.Array], State]:
         """Performs resetting of the environment."""
+        traitor_idxs = jax.random.choice(
+            key, self.num_agents, shape=(self.init_traitors,), replace=False
+        )
+        traitors = jax.nn.one_hot(traitor_idxs, self.num_agents).sum(axis=0)
 
-        raise NotImplementedError
+        state = State(
+            config=self.config,
+            day=0,
+            activity=Activity.CHALLENGE,
+            phase=ChallengePhase.ATTEMPT_SHIELD,
+            phase_step=1,
+            finished=False,
+            players=jnp.arange(self.num_agents),
+            traitors=traitors,
+            murdered=jnp.zeros(self.num_agents),
+            banished=jnp.zeros(self.num_agents),
+            at_risk=jnp.zeros(self.num_agents),
+            has_shield=jnp.zeros(self.num_agents),
+            last_death=jnp.zeros(self.num_agents),
+            traitor_target_selection=None,
+            traitor_action_selection=None,
+            banishment_selection=None,
+            banish_again=None,
+        )
+
+        return self.get_obs(state), state
 
     @partial(jax.jit, static_argnums=(0,))
     def step(
@@ -116,11 +180,86 @@ class TraitorsGame(MultiAgentEnv):
         self, key: chex.PRNGKey, state: State, actions: Dict[str, chex.Array]
     ) -> Tuple[Dict[str, chex.Array], State, Dict[str, float], Dict[str, bool], Dict]:
         """Environment-specific step transition."""
-        raise NotImplementedError
+        # if self.is_first_activity_of_day:
+        #     logger.heading_1(self.day)
+        #     logger.info("There are %d players remaining.", len(self.players))
 
-    def get_obs(self, state: State) -> Dict[str, chex.Array]:
+        if state.activity == Activity.BREAKFAST:
+            GameLogic.run_breakfast(key, state, actions)
+        elif state.activity == Activity.CHALLENGE:
+            GameLogic.run_challenge(key, state, actions)
+        elif state.activity == Activity.ROUNDTABLE:
+            GameLogic.run_roundtable(key, state, actions)
+        elif state.activity == Activity.SECRET_MEETING:
+            GameLogic.run_secret_meeting(key, state, actions)
+        elif state.activity == Activity.ENDGAME:
+            GameLogic.run_endgame(key, state, actions)
+        else:
+            raise ValueError("Invalid activity.")
+
+    def get_obs(self, state: State) -> Dict[int, chex.Array]:
         """Applies observation function to state."""
-        raise NotImplementedError
+
+        @partial(jax.vmap, in_axes=[0, None])
+        def _agent_obs(agent_id: int, state: State) -> chex.Array:
+            """Generate individual agent's observation"""
+            id = jax.nn.one_hot(agent_id, self.num_agents)
+
+            # Time
+            day = jax.nn.one_hot(state.day, self.num_days)
+            activity = jax.nn.one_hot(state.activity.value, TraitorsGame.NUM_ACTIVITIES)
+            phase = jax.nn.one_hot(state.phase.value, TraitorsGame.MAX_PHASES)
+            phase_step = jax.nn.one_hot(state.phase_step, TraitorsGame.MAX_PHASE_STEPS)
+
+            # Players
+            dead = jnp.where((state.murdered + state.banished) > 0, 1, 0)
+            faithful = jnp.where(state.traitors == 0, 1, 0)
+            traitors = jnp.where(state.traitors == 1, 1, 0)
+            shields = jnp.where(state.has_shield == 1, 1, 0)
+            at_risk = jnp.where(state.at_risk == 1, 1, 0)
+
+            # Open signals
+            open_signals = jnp.zeros(
+                (self.num_symbols, self.num_agents, self.num_agents)
+            ).flatten()
+            votes = jnp.zeros((self.num_agents, self.num_agents)).flatten()
+
+            # Hidden signals
+            hidden_signals = jnp.zeros(
+                (self.num_symbols, self.num_agents, self.num_agents)
+            ).flatten()
+            t_action_votes = jnp.zeros((2, self.num_agents)).flatten()
+            t_target_votes = jnp.zeros((self.num_agents, self.num_agents)).flatten()
+
+            # Endgame votes
+            endgame_votes = jnp.zeros((2, self.num_agents)).flatten()
+
+            # Full observation
+            obs = jnp.concatenate(
+                [
+                    id,
+                    day,
+                    activity,
+                    phase,
+                    phase_step,
+                    dead,
+                    faithful,
+                    traitors,
+                    shields,
+                    at_risk,
+                    open_signals,
+                    votes,
+                    hidden_signals,
+                    t_action_votes,
+                    t_target_votes,
+                    endgame_votes,
+                ]
+            )
+
+            return obs
+
+        obs = _agent_obs(jnp.arange(self.num_agents), state)
+        return {i: obs[i] for i in range(self.num_agents)}
 
     def observation_space(self, agent: str):
         """Observation space for a given agent."""
@@ -146,38 +285,16 @@ class TraitorsGame(MultiAgentEnv):
 
 
 def example():
-    num_agents = 5
     key = jax.random.PRNGKey(0)
 
     from jaxmarl import make
+    from .shared import uk_series_2
 
-    env = make("switch_riddle", num_agents=num_agents)
+    env = make("traitors", config=uk_series_2())
 
     obs, state = env.reset(key)
-    env.render(state)
-
-    for _ in range(20):
-        key, key_reset, key_act, key_step = jax.random.split(key, 4)
-
-        env.render(state)
-        print("obs:", obs)
-
-        # Sample random actions.
-        key_act = jax.random.split(key_act, env.num_agents)
-        actions = {
-            agent: env.action_space(agent).sample(key_act[i])
-            for i, agent in enumerate(env.agents)
-        }
-
-        print(
-            "action:",
-            env.game_actions_idx[actions[env.agents[state.agent_in_room]].item()],
-        )
-
-        # Perform the step transition.
-        obs, state, reward, done, infos = env.step(key_step, state, actions)
-
-        print("reward:", reward["agent_0"])
+    print(jax.tree_util.tree_map(lambda x: x.shape, obs))
+    print(jax.tree_util.tree_map(lambda x: x.shape if "shape" in dir(x) else x, state))
 
 
 if __name__ == "__main__":

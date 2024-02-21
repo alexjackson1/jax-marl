@@ -26,6 +26,7 @@ from .environments import (
     HanabiGame,
     Overcooked,
     CoinGame,
+    TraitorsGame,
 )
 
 
@@ -93,7 +94,7 @@ def make(env_id: str, **env_kwargs):
     # 5. InTheGrid
     elif env_id == "storm_2p":
         env = InTheGrid_2p(**env_kwargs)
-    
+
     # 6. Hanabi
     elif env_id == "hanabi":
         env = HanabiGame(**env_kwargs)
@@ -105,6 +106,10 @@ def make(env_id: str, **env_kwargs):
     # 8. Coin Game
     elif env_id == "coin_game":
         env = CoinGame(**env_kwargs)
+
+    # 9. Traitors
+    elif env_id == "traitors":
+        env = TraitorsGame(**env_kwargs)
 
     return env
 
@@ -136,4 +141,5 @@ registered_envs = [
     "hanabi",
     "overcooked",
     "coin_game",
+    "traitors",
 ]
