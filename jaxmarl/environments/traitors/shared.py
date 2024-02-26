@@ -1,4 +1,4 @@
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Union
 import chex
 
@@ -43,7 +43,7 @@ class Config:
         return s
 
 
-class Activity(Enum):
+class Activity(IntEnum):
     """Enumeration of possible activities in the game."""
 
     BREAKFAST = 0
@@ -54,27 +54,27 @@ class Activity(Enum):
     ENDGAME = 5
 
 
-class BreakfastPhase(Enum):
+class BreakfastPhase(IntEnum):
     GROUP_DISCUSSION = 1
 
 
-class ChallengePhase(Enum):
+class ChallengePhase(IntEnum):
     ATTEMPT_SHIELD = 1
 
 
-class RoundtablePhase(Enum):
+class RoundtablePhase(IntEnum):
     GROUP_DISCUSSION = 1
     ROUNDTABLE_VOTE = 2
 
 
-class SecretMeetingPhase(Enum):
+class SecretMeetingPhase(IntEnum):
     TRAITORS_DISCUSSION = 1
     TRAITORS_ACTION_VOTE = 2
     TRAITORS_TARGET_VOTE = 3
     RECRUITMENT_OFFER = 4
 
 
-class EndgamePhase(Enum):
+class EndgamePhase(IntEnum):
     ENDGAME_VOTE = 1
     ENDGAME_BANISHMENT = 2
 

@@ -1,68 +1,18 @@
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 from functools import partial
 
 import jax
 import jax.numpy as jnp
-
 import chex
-from flax import struct
 
-from jaxmarl.environments.multi_agent_env import MultiAgentEnv
-from jaxmarl.environments.spaces import Discrete
+from ..multi_agent_env import MultiAgentEnv
 
-from .shared import Activity, ChallengePhase, Config, Phase
-from .schedule import next_timestep
+from .shared import Activity, Config
 from .logic import GameLogic
-
-
-@struct.dataclass
-class State:
-    config: Config
-
-    # Timestep
-    day: int
-    activity: Activity
-    phase: Phase
-    phase_step: int
-    finished: bool
-
-    # Player Properties
-    players: chex.Array  # id of player
-    traitors: chex.Array  # 1 if traitor
-    murdered: chex.Array  # 1 if murdered
-    banished: chex.Array  # 1 if banished
-    at_risk: chex.Array  # 1 if at risk
-    has_shield: chex.Array  # 1 if has shield
-
-    # Game state
-    last_death: Optional[int]  # id of last death
-
-    banishment_selection: Optional[int]  # Group banishment target
-    traitor_action_selection: Optional[int]  # Traitor action
-    traitor_target_selection: Optional[int]  # Traitor recruitment/murder target
-    banish_again: Optional[bool]  # Whether to banish again in the endgame
-
-    def step(self) -> "State":
-        ts = next_timestep(self, self.config)
-        return self.replace(
-            day=ts.day,
-            activity=ts.activity,
-            phase=ts.phase,
-            phase_step=ts.phase_step,
-            finished=ts.finished,
-        )
-
-    def reset_shields(self) -> "State":
-        return self.replace(has_shield=jnp.zeros_like(self.has_shield))
-
-    def discover_death(self) -> "State":
-        if self.last_death is not None:
-            new_murdered = jnp.where(
-                self.murdered == 1 or self.players == self.last_death, 1, 0
-            )
-            return self.replace(murdered=new_murdered, last_death=None)
-
-        return self
+from .actions import ActionSpace
+from .observations import ObservationSpace
+from .state import State
+from .logger import GameLogger
 
 
 class TraitorsGame(MultiAgentEnv):
@@ -75,6 +25,7 @@ class TraitorsGame(MultiAgentEnv):
     def __init__(self, config: Config) -> None:
         """Construct a new TraitorsGame environment."""
         self.config = config
+        self.logger = GameLogger("traitors")
 
         # Basic configuration
         self.num_agents = config.num_agents
@@ -92,9 +43,24 @@ class TraitorsGame(MultiAgentEnv):
 
         # Initialise action/observation spaces
         self.agent_ids = [i for i in range(self.num_agents)]
-        self.action_set = jnp.arange(self.num_moves)
-        self.action_spaces = {i: Discrete(self.num_moves) for i in self.agent_ids}
-        self.observation_spaces = {i: Discrete(self.obs_size) for i in self.agent_ids}
+
+        self.action_spaces = {
+            i: ActionSpace(self.num_agents, self.num_symbols, self.num_symbols)
+            for i in self.agent_ids
+        }
+
+        self.observation_spaces = {
+            i: ObservationSpace(
+                self.num_agents,
+                self.num_days,
+                TraitorsGame.NUM_ACTIVITIES,
+                TraitorsGame.MAX_PHASES,
+                TraitorsGame.MAX_PHASE_STEPS,
+                self.num_symbols,
+                self.num_symbols,
+            )
+            for i in self.agent_ids
+        }
 
     def count_moves(self) -> int:
         return sum(
@@ -129,71 +95,48 @@ class TraitorsGame(MultiAgentEnv):
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, key: chex.PRNGKey) -> Tuple[Dict[str, chex.Array], State]:
         """Performs resetting of the environment."""
-        traitor_idxs = jax.random.choice(
-            key, self.num_agents, shape=(self.init_traitors,), replace=False
-        )
-        traitors = jax.nn.one_hot(traitor_idxs, self.num_agents).sum(axis=0)
-
-        state = State(
-            config=self.config,
-            day=0,
-            activity=Activity.CHALLENGE,
-            phase=ChallengePhase.ATTEMPT_SHIELD,
-            phase_step=1,
-            finished=False,
-            players=jnp.arange(self.num_agents),
-            traitors=traitors,
-            murdered=jnp.zeros(self.num_agents),
-            banished=jnp.zeros(self.num_agents),
-            at_risk=jnp.zeros(self.num_agents),
-            has_shield=jnp.zeros(self.num_agents),
-            last_death=jnp.zeros(self.num_agents),
-            traitor_target_selection=None,
-            traitor_action_selection=None,
-            banishment_selection=None,
-            banish_again=None,
-        )
-
+        state = State.create(key, self.config)
         return self.get_obs(state), state
-
-    @partial(jax.jit, static_argnums=(0,))
-    def step(
-        self, key: chex.PRNGKey, state: State, actions: Dict[str, chex.Array]
-    ) -> Tuple[Dict[str, chex.Array], State, Dict[str, float], Dict[str, bool], Dict]:
-        """Performs step transitions in the environment."""
-
-        key, key_reset = jax.random.split(key)
-        obs_st, states_st, rewards, dones, infos = self.step_env(key, state, actions)
-
-        obs_re, states_re = self.reset(key_reset)
-
-        # Auto-reset environment based on termination
-        states = jax.tree_map(
-            lambda x, y: jax.lax.select(dones["__all__"], x, y), states_re, states_st
-        )
-        obs = jax.tree_map(
-            lambda x, y: jax.lax.select(dones["__all__"], x, y), obs_re, obs_st
-        )
-        return obs, states, rewards, dones, infos
 
     def step_env(
         self, key: chex.PRNGKey, state: State, actions: Dict[str, chex.Array]
     ) -> Tuple[Dict[str, chex.Array], State, Dict[str, float], Dict[str, bool], Dict]:
         """Environment-specific step transition."""
-        # if self.is_first_activity_of_day:
-        #     logger.heading_1(self.day)
-        #     logger.info("There are %d players remaining.", len(self.players))
-
+        # state = state.clear_transient()
         if state.activity == Activity.BREAKFAST:
-            GameLogic.run_breakfast(key, state, actions)
+            state = GameLogic.run_breakfast(key, state, actions, self.logger)
         elif state.activity == Activity.CHALLENGE:
-            GameLogic.run_challenge(key, state, actions)
+            state = GameLogic.run_challenge(key, state, actions, self.logger)
         elif state.activity == Activity.ROUNDTABLE:
-            GameLogic.run_roundtable(key, state, actions)
+            state = GameLogic.run_roundtable(key, state, actions, self.logger)
         elif state.activity == Activity.SECRET_MEETING:
-            GameLogic.run_secret_meeting(key, state, actions)
+            state = GameLogic.run_secret_meeting(key, state, actions, self.logger)
         elif state.activity == Activity.ENDGAME:
-            GameLogic.run_endgame(key, state, actions)
+            state = GameLogic.run_endgame(key, state, actions, self.logger)
+        else:
+            raise ValueError("Invalid activity.")
+
+        obs = self.get_obs(state)
+        # TODO: Add rewards
+        rewards = {a: 100 for a in range(self.num_agents)}
+        dones = {a: False for a in range(self.num_agents)}
+        dones["__all__"] = state.finished
+        info = {}
+
+        return obs, state, rewards, dones, info
+
+    def get_mask(self, state: State) -> Dict[int, chex.Array]:
+        """Applies mask function to state."""
+        if state.activity == Activity.BREAKFAST:
+            return GameLogic.get_breakfast_mask(state, self.action_spaces)
+        elif state.activity == Activity.CHALLENGE:
+            return GameLogic.get_challenge_mask(state, self.action_spaces)
+        elif state.activity == Activity.ROUNDTABLE:
+            return GameLogic.get_roundtable_mask(state, self.action_spaces)
+        elif state.activity == Activity.SECRET_MEETING:
+            return GameLogic.get_secret_meeting_mask(state, self.action_spaces)
+        elif state.activity == Activity.ENDGAME:
+            return GameLogic.get_endgame_mask(state, self.action_spaces)
         else:
             raise ValueError("Invalid activity.")
 
@@ -207,14 +150,14 @@ class TraitorsGame(MultiAgentEnv):
 
             # Time
             day = jax.nn.one_hot(state.day, self.num_days)
-            activity = jax.nn.one_hot(state.activity.value, TraitorsGame.NUM_ACTIVITIES)
-            phase = jax.nn.one_hot(state.phase.value, TraitorsGame.MAX_PHASES)
+            activity = jax.nn.one_hot(state.activity, TraitorsGame.NUM_ACTIVITIES)
+            phase = jax.nn.one_hot(state.phase, TraitorsGame.MAX_PHASES)
             phase_step = jax.nn.one_hot(state.phase_step, TraitorsGame.MAX_PHASE_STEPS)
 
             # Players
-            dead = jnp.where((state.murdered + state.banished) > 0, 1, 0)
-            faithful = jnp.where(state.traitors == 0, 1, 0)
-            traitors = jnp.where(state.traitors == 1, 1, 0)
+            dead = jnp.where((state.eliminated + state.banished) > 0, 1, 0)
+            faithful = jnp.where(state.roles == 0, 1, 0)
+            traitors = jnp.where(state.roles == 1, 1, 0)
             shields = jnp.where(state.has_shield == 1, 1, 0)
             at_risk = jnp.where(state.at_risk == 1, 1, 0)
 
@@ -261,18 +204,10 @@ class TraitorsGame(MultiAgentEnv):
         obs = _agent_obs(jnp.arange(self.num_agents), state)
         return {i: obs[i] for i in range(self.num_agents)}
 
-    def observation_space(self, agent: str):
-        """Observation space for a given agent."""
-        return self.observation_spaces[agent]
-
-    def action_space(self, agent: str):
-        """Action space for a given agent."""
-        return self.action_spaces[agent]
-
     @property
     def name(self) -> str:
         """Environment name."""
-        return type(self).__name__
+        return "Traitors"
 
     @property
     def agent_classes(self) -> dict:
@@ -292,9 +227,37 @@ def example():
 
     env = make("traitors", config=uk_series_2())
 
+    def _print_obs(obs):
+        return jax.tree_util.tree_map(lambda x: x.shape, obs)
+
+    def _print_state(state):
+        return jax.tree_util.tree_map(
+            lambda x: x.shape if "shape" in dir(x) else x, state
+        )
+
     obs, state = env.reset(key)
-    print(jax.tree_util.tree_map(lambda x: x.shape, obs))
-    print(jax.tree_util.tree_map(lambda x: x.shape if "shape" in dir(x) else x, state))
+
+    while state.day <= 1:
+        print(state.timestep)
+
+        key, key_reset, key_act, key_step = jax.random.split(key, 4)
+
+        # print("obs:", _print_obs(obs))
+        # print("state:", _print_state(state))
+
+        # Sample random actions.
+        key_act = jax.random.split(key_act, env.num_agents)
+        actions = {
+            agent: env.action_space(agent).sample(key_act[i])
+            for i, agent in enumerate(env.agent_ids)
+        }
+
+        # print("actions:", actions)
+
+        # Perform the step transition.
+        obs, state, reward, done, infos = env.step(key_step, state, actions)
+
+        # print("reward:", reward[0])
 
 
 if __name__ == "__main__":

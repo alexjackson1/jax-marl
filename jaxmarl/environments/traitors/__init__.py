@@ -46,6 +46,7 @@ activities.
 """
 
 from .interface import TraitorsGame, State
+
 from .shared import (
     Activity,
     Phase,

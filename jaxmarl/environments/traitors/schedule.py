@@ -217,7 +217,7 @@ def next_timestep(state: "State", config: Config) -> Timestep:
 
         elif state.phase == EndgamePhase.ENDGAME_BANISHMENT:
             if state.phase_step == 1:
-                if config.num_agents - sum(state.murdered + state.banished) <= 2:
+                if config.num_agents - sum(state.eliminated + state.banished) <= 2:
                     return Timestep(
                         state.day,
                         state.activity,
