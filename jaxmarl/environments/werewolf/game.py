@@ -169,7 +169,7 @@ class WerewolfGame(MultiAgentEnv):
         ids = jr.permutation(id_shuff, self.num_agents)
         roles = WerewolfGame.assign_roles(role_shuff, counts)
         state = State.create(ids, roles, WerewolfGame.MAX_DAY)
-        return self.get_obs(state), state
+        return lax.stop_gradient(self.get_obs(state)), lax.stop_gradient(state)
 
     # Step and transition functions ============================================
     @partial(jax.jit, static_argnums=[0])
@@ -180,15 +180,32 @@ class WerewolfGame(MultiAgentEnv):
         # Initialise the reward array and info dict
         rewards, infos = jnp.zeros(self.num_agents), {}
 
-        # Update the state w.r.t. the actions
-        state, actions, rewards = self.update_data(state, actions, rewards)
-        state, actions, rewards = self.run_actions(key, state, actions, rewards)
-        state = self._next_phase(state)
+        def f1(key, state, actions, rewards):
+            # Update the state w.r.t. the actions
+            state, actions, rewards = self.update_data(state, actions, rewards)
+            state, actions, rewards = self.run_actions(key, state, actions, rewards)
+            state = self._next_phase(state)
+            return state, actions, rewards, False
 
-        # Check the end conditions and return
+        def f2(state, actions, rewards):
+            return state, actions, rewards, True
+
+        state, actions, rewards, is_done = lax.cond(
+            state.finished,
+            lambda _: f2(state, actions, rewards),
+            lambda _: f1(key, state, actions, rewards),
+            operand=None,
+        )
+
         state, rewards = self.check_end_conditions(state, rewards)
-        dones = {"__all__": state.finished}
-        return self.get_obs(state), state, rewards, dones, infos
+
+        return (
+            lax.stop_gradient(self.get_obs(state)),
+            lax.stop_gradient(state),
+            lax.stop_gradient(rewards),
+            {"__all__": is_done},
+            infos,
+        )
 
     def update_data(
         self, state: State, actions: Actions, rewards: chex.Array
@@ -475,18 +492,17 @@ def text_render(state: State):
 def example():
     print("Werewolf example")
     num_agents = 8
-    key = jr.PRNGKey(4)
+    key = jr.PRNGKey(0)
 
     from jaxmarl import make
 
     env = make("werewolf", num_agents=num_agents, num_wolves=2)
 
     obs, state = env.reset(key)
-    # env.render(state)
-
     state: State = state
 
-    while not state.finished:
+    winners = []
+    while len(winners) < 10:
         print("Day:", state.day, "Phase:", Phase.label(state.phase))
 
         key, key_act, key_step = jax.random.split(key, 3)
@@ -499,11 +515,15 @@ def example():
         }
 
         # Perform the step transition.
-        obs, state, reward, done, infos = env.step(key_step, state, actions)
+        obs, state, reward, dones, infos = env.step(key_step, state, actions)
         text_render(state)
 
         if state.finished:
-            print(Winner.label(state.winner))
+            winners.append(Winner.label(state.winner))
+            print("Winner:", Winner.label(state.winner))
+            print("")
+
+    print("Winners:", winners)
 
 
 if __name__ == "__main__":
