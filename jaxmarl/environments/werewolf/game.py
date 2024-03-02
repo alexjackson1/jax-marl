@@ -1,8 +1,9 @@
 from enum import IntEnum
 from functools import partial
-from typing import Dict, List, Literal, OrderedDict, Tuple
+from typing import Dict, List, Literal, OrderedDict, Tuple, Union
 
 import jax
+import jax.lax as lax
 import jax.numpy as jnp
 import jax.random as jr
 import chex
@@ -40,6 +41,17 @@ class Phase(IntEnum):
         ][phase]
 
 
+class Winner(IntEnum):
+    TIMEOUT = -1
+    NONE = 0
+    VILLAGERS = 1
+    WOLVES = 2
+
+    @staticmethod
+    def label(winner: "Winner") -> str:
+        return ["None", "Villagers", "Wolves", "Timeout"][winner]
+
+
 @struct.dataclass
 class State:
     """State of the environment."""
@@ -47,6 +59,8 @@ class State:
     # Game information
     phase: Phase
     day: int
+    finished: bool
+    winner: chex.Array
 
     # Player information
     status: chex.Array  # 1: alive, 0: dead
@@ -66,6 +80,8 @@ class State:
         return State(
             phase=Phase.WOLF_DISCUSSION,
             day=0,
+            finished=False,
+            winner=Winner.NONE,
             status=jnp.ones_like(ids),
             role=roles,
             votes=jnp.zeros((num_agents, num_agents)),
@@ -79,6 +95,9 @@ class State:
 
 @chex.dataclass
 class RewardConfig:
+    victory: float = +25.0
+    loss: float = -25.0
+
     death: float = -1.0
     kill: float = 1.0
     execute_dead: float = -1.0
@@ -166,9 +185,10 @@ class WerewolfGame(MultiAgentEnv):
         state, actions, rewards = self.run_actions(key, state, actions, rewards)
         state = self._next_phase(state)
 
-        # Get the next observation and return the results
-        obs, done = self.get_obs(state), {"__all__": False}
-        return obs, state, rewards, done, infos
+        # Check the end conditions and return
+        state, rewards = self.check_end_conditions(state, rewards)
+        dones = {"__all__": state.finished}
+        return self.get_obs(state), state, rewards, dones, infos
 
     def update_data(
         self, state: State, actions: Actions, rewards: chex.Array
@@ -179,7 +199,7 @@ class WerewolfGame(MultiAgentEnv):
 
         # Update wolf targets or everyone's votes
         for agent, action in actions.items():
-            state = jax.lax.cond(
+            state = lax.cond(
                 (state.phase == Phase.PLAYER_BANISHED)
                 | (state.phase == Phase.TOWN_DISCUSSION),
                 lambda _: self._update_vote(state, agent, action["target"]),
@@ -197,7 +217,7 @@ class WerewolfGame(MultiAgentEnv):
     ) -> Tuple[State, Actions, chex.Array]:
         """Processes the deaths of the agents."""
         # Banishment
-        state, actions, rewards = jax.lax.cond(
+        state, actions, rewards = lax.cond(
             (state.phase == Phase.PLAYER_BANISHED),
             lambda _: self.run_town_actions(key, state, actions, rewards),
             lambda _: self._no_op(key, state, actions, rewards),
@@ -205,7 +225,7 @@ class WerewolfGame(MultiAgentEnv):
         )
 
         # Eaten by wolves
-        state, actions, rewards = jax.lax.cond(
+        state, actions, rewards = lax.cond(
             (state.phase == Phase.PLAYER_IS_EATEN),
             lambda _: self.run_wolf_actions(key, state, actions, rewards),
             lambda _: self._no_op(key, state, actions, rewards),
@@ -222,7 +242,6 @@ class WerewolfGame(MultiAgentEnv):
         rewards: chex.Array,
     ) -> Tuple[State, Dict[int, Dict[str, int]], chex.Array]:
         target_idx = self._compute_target(key, state.votes)
-        print("target_idx:", target_idx)
 
         # Update the number of agents voting for themselves
         self_vote_count = jnp.trace(state.votes)
@@ -291,6 +310,39 @@ class WerewolfGame(MultiAgentEnv):
 
         return state, actions, rewards
 
+    def check_end_conditions(
+        self, state: State, rewards: Dict[AgentID, float]
+    ) -> Tuple[State, chex.Array]:
+        # Compute the number of wolves and villagers
+        wolves = jnp.sum(state.role * state.status)
+        villagers = jnp.sum(state.status) - wolves
+
+        # Check if the wolves have won
+        state, rewards = lax.cond(
+            (wolves >= villagers),
+            lambda _: self._wolf_win(state, rewards),
+            lambda _: (state, rewards),
+            operand=None,
+        )
+
+        # # Check if the villagers have won
+        state, rewards = lax.cond(
+            (wolves == 0),
+            lambda _: self._villager_win(state, rewards),
+            lambda _: (state, rewards),
+            operand=None,
+        )
+
+        # # Check if the time has elapsed
+        state, rewards = lax.cond(
+            (state.day >= self.MAX_DAY - 1),
+            lambda _: self._timeout(state, rewards),
+            lambda _: (state, rewards),
+            operand=None,
+        )
+
+        return state, rewards
+
     def _next_phase(self, state: State) -> State:
         new_phase = (state.phase + 1) % WerewolfGame.NUM_PHASES
         new_day = state.day + (new_phase == 0)
@@ -330,6 +382,29 @@ class WerewolfGame(MultiAgentEnv):
     ) -> State:
         chex.assert_shape(wolf, ())
         return state.replace(cannibalism=state.cannibalism.at[day, phase].set(wolf))
+
+    def _wolf_win(self, state: State, rewards: chex.Array) -> Tuple[State, chex.Array]:
+        state = state.replace(finished=True, winner=Winner.WOLVES)
+
+        rewards = rewards + state.role * self._reward_config.victory
+        rewards = rewards + (1 - state.role) * self._reward_config.loss
+
+        return state, rewards
+
+    def _villager_win(
+        self, state: State, rewards: chex.Array
+    ) -> Tuple[State, chex.Array]:
+        state = state.replace(finished=True, winner=Winner.VILLAGERS)
+
+        rewards = rewards + (1 - state.role) * self._reward_config.victory
+        rewards = rewards + state.role * self._reward_config.loss
+
+        return state, rewards
+
+    def _timeout(self, state: State, rewards: chex.Array) -> Tuple[State, chex.Array]:
+        state = state.replace(finished=True, winner=Winner.TIMEOUT)
+        rewards = rewards + self._reward_config.loss
+        return state, rewards
 
     # Observation and rendering ================================================
     def get_obs(self, state: State) -> Dict[AgentID, chex.Array]:
@@ -393,7 +468,6 @@ class WerewolfGame(MultiAgentEnv):
 def text_render(state: State):
     x = ["W" if r == 1 else "V" for r in state.role.tolist()]
     y = ["X" if s == 0 else " " for s in state.status.tolist()]
-    print("Day:", state.day, "Phase:", Phase.label(state.phase))
     print("P:", " ".join(x))
     print("D:", " ".join(y))
 
@@ -401,7 +475,7 @@ def text_render(state: State):
 def example():
     print("Werewolf example")
     num_agents = 8
-    key = jax.random.PRNGKey(0)
+    key = jr.PRNGKey(4)
 
     from jaxmarl import make
 
@@ -410,15 +484,12 @@ def example():
     obs, state = env.reset(key)
     # env.render(state)
 
-    state = state.replace()
+    state: State = state
 
-    for i in range(10):
-        loop_key = jr.fold_in(key, i)
-        key_act, key_step = jr.split(loop_key, 2)
-        text_render(state)
+    while not state.finished:
+        print("Day:", state.day, "Phase:", Phase.label(state.phase))
 
-        # env.render(state)
-        # print("obs:", obs)
+        key, key_act, key_step = jax.random.split(key, 3)
 
         # Sample random actions.
         key_act = jax.random.split(key_act, env.num_agents)
@@ -427,13 +498,15 @@ def example():
             for i, agent in enumerate(env.agents)
         }
 
-        # print(actions)
-
         # Perform the step transition.
         obs, state, reward, done, infos = env.step(key_step, state, actions)
+        text_render(state)
+
+        if state.finished:
+            print(Winner.label(state.winner))
 
 
 if __name__ == "__main__":
-    with jax.disable_jit():
-        example()
-    # example()
+    # with jax.disable_jit():
+    #     example()
+    example()
