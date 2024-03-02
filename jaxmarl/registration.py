@@ -26,6 +26,7 @@ from .environments import (
     HanabiGame,
     Overcooked,
     CoinGame,
+    WerewolfGame,
 )
 
 
@@ -106,6 +107,10 @@ def make(env_id: str, **env_kwargs):
     elif env_id == "coin_game":
         env = CoinGame(**env_kwargs)
 
+    # 9. Werewolf
+    elif env_id == "werewolf":
+        env = WerewolfGame(**env_kwargs)
+
     return env
 
 registered_envs = [
@@ -136,4 +141,5 @@ registered_envs = [
     "hanabi",
     "overcooked",
     "coin_game",
+    "werewolf",
 ]
