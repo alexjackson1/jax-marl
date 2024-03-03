@@ -1,8 +1,38 @@
+from typing import TYPE_CHECKING
 import matplotlib.pyplot as plt
 import chex
 
+if TYPE_CHECKING:
+    from .logic import State
 
-class WerewolfRender:
+
+class TextRenderer:
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    ORANGE = "\033[93m"
+    PURPLE = "\033[95m"
+    GREY = "\033[90m"
+    BOLD = "\033[1m"
+    STRIKE = "\033[9m"
+    END = "\033[0m"
+
+    @classmethod
+    def state(cls, state: "State"):
+        f = lambda r, s: cls.wolf(s == 0) if r == 1 else cls.villager(s == 0)
+        return " ".join([f(r, s) for r, s in zip(state.role, state.status)])
+
+    @classmethod
+    def wolf(cls, dead: bool):
+        x = cls.BOLD + cls.PURPLE if not dead else cls.GREY
+        return f"{x}W{cls.END}"
+
+    @classmethod
+    def villager(cls, dead: bool):
+        x = cls.BOLD + cls.ORANGE if not dead else cls.GREY
+        return f"{x}V{cls.END}"
+
+
+class PlotRenderer:
 
     def __init__(self, num_agents: int):
         self.num_agents = num_agents
